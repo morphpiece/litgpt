@@ -5,12 +5,16 @@ import inspect
 import math
 import os
 import pickle
+import re
 import shutil
 import sys
 from dataclasses import asdict, is_dataclass
 from io import BytesIO
+from packaging import version
 from pathlib import Path
+import subprocess
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Mapping, Optional, TypeVar, Union
+import warnings
 
 import lightning as L
 import torch
@@ -24,6 +28,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.cli import instantiate_class
 from torch.serialization import normalize_storage_type
 from typing_extensions import Self
+
 
 if TYPE_CHECKING:
     from litgpt import GPT, Config
@@ -75,7 +80,7 @@ def reset_parameters(module: nn.Module) -> None:
             mod.reset_parameters()
 
 
-def check_valid_checkpoint_dir(checkpoint_dir: Path, model_filename: str = "lit_model.pth") -> None:
+def check_valid_checkpoint_dir(checkpoint_dir: Path, model_filename: str = "lit_model.pth", verbose: bool = True, raise_error: bool = False) -> None:
     files = {
         model_filename: (checkpoint_dir / model_filename).is_file(),
         "model_config.yaml": (checkpoint_dir / "model_config.yaml").is_file(),
@@ -99,13 +104,18 @@ def check_valid_checkpoint_dir(checkpoint_dir: Path, model_filename: str = "lit_
     else:
         extra = ""
 
-    error_message = (
-        f"checkpoint_dir {str(checkpoint_dir.absolute())!r}{problem}."
-        "\nFind download instructions at https://github.com/Lightning-AI/litgpt/blob/main/tutorials\n"
-        f"{extra}\nSee all download options by running:\n litgpt download"
-    )
-    print(error_message, file=sys.stderr)
-    raise SystemExit(1)
+    if verbose:
+        error_message = (
+            f"checkpoint_dir {str(checkpoint_dir.absolute())!r}{problem}."
+            "\nFind download instructions at https://github.com/Lightning-AI/litgpt/blob/main/tutorials\n"
+            f"{extra}\nSee all download options by running:\n litgpt download"
+        )
+        print(error_message, file=sys.stderr)
+
+    if raise_error:
+        raise FileNotFoundError(f"checkpoint_dir {str(checkpoint_dir.absolute())!r}{problem}.")
+    else:
+        raise SystemExit(1)
 
 
 class SavingProxyForStorage:
@@ -249,7 +259,14 @@ class incremental_save:
         if storage.device.type != "cpu":
             storage = storage.cpu()
         num_bytes = storage.nbytes()
-        self.zipfile.write_record(name, storage.data_ptr(), num_bytes)
+
+        current_version = version.parse(torch.__version__)
+        threshold_version = version.parse("2.2.2")
+        if current_version <= threshold_version:
+            self.zipfile.write_record(name, storage.data_ptr(), num_bytes)
+        else:
+            self.zipfile.write_record(name, storage, num_bytes)
+
         return key
 
     def __exit__(self, type, value, traceback):
@@ -539,3 +556,89 @@ def extend_checkpoint_dir(checkpoint_dir: Path) -> Path:
                              not checkpoint_dir.is_absolute() and
                              new_checkpoint_dir.exists())
     return new_checkpoint_dir if should_return_new_dir else checkpoint_dir
+
+
+def check_file_size_on_cpu_and_warn(checkpoint_path, device, size_limit=4_509_715_660):
+    """
+    Checks the file size and raises a warning if it exceeds the size_limit.
+    The default size limit is 4.2 GB, the size of TinyLlama 1.1B: 4.2 * 1024 * 1024 * 1024 = 4_509_715_660
+    """
+    size = 0.0
+    if os.path.exists(checkpoint_path):
+        size = os.path.getsize(checkpoint_path)
+        if size > size_limit and str(device) == "cpu":
+            warnings.warn(
+                f"The file size of {checkpoint_path} is over {size_limit/1024/1024/1024:.1f} GB. Using a model "
+                "with more than 1B parameters on a CPU can be slow, it is recommended to switch to a GPU."
+            )
+    return size
+
+
+def auto_download_checkpoint(model_name, access_token=None):
+    from litgpt.scripts.download import download_from_hub  # moved here due to circular import issue
+
+    checkpoint_dir = extend_checkpoint_dir(Path(model_name))
+    try:
+        check_valid_checkpoint_dir(checkpoint_dir, verbose=False, raise_error=True)
+    except FileNotFoundError as e:
+        if access_token is None:
+            access_token = os.getenv("HF_TOKEN")
+
+        if checkpoint_dir.parts[0] != "checkpoints" and not checkpoint_dir.is_absolute():
+            download_from_hub(repo_id=str(model_name), access_token=access_token)
+            checkpoint_dir = Path("checkpoints") / checkpoint_dir
+        else:
+            raise e
+
+    return checkpoint_dir
+
+
+def check_nvlink_connectivity(fabric=None):
+    if fabric is not None:
+        custom_print = fabric.print
+    else:
+        custom_print = print
+    if os.getenv("RANK", "0") == "0":
+        try:
+            result = subprocess.run(["nvidia-smi", "topo", "-m"], stdout=subprocess.PIPE, text=True)
+
+            if result.returncode != 0:
+                custom_print("Failed to run nvidia-smi")
+                return
+
+            lines = result.stdout.split('\n')
+            gpu_matrix = []
+
+            start_index = next((i for i, line in enumerate(lines) if "GPU0" in line), None) + 1
+            headers_line = lines[start_index - 1]
+            headers = headers_line.split()
+            # The regex is to avoid counting the "GPU NUMA ID" header as a GPU
+            # in headers like ['\x1b[4mGPU0', 'GPU1', 'GPU2', 'GPU3', 'GPU4', 'GPU5', 'GPU6', 'GPU7', 'NIC0', 'NIC1', 'NIC2', 'NIC3', 'NIC4', 'NIC5', 'NIC6', 'NIC7', 'NIC8', 'NIC9', 'CPU', 'Affinity', 'NUMA', 'Affinity', 'GPU', 'NUMA', 'ID\x1b[0m']
+            gpu_regex = re.compile(r'^GPU\d+$')
+            gpu_count = len([header for header in headers if gpu_regex.match(header)])
+
+            for line in lines[start_index:]:
+                if not line.strip():
+                    break
+                gpu_matrix.append(line.strip())
+
+            all_nvlink = True
+            for line in gpu_matrix:
+                connections = line.split()[1:1 + gpu_count]
+                if not all("NV" in conn for conn in connections if conn != "X"):
+                    all_nvlink = False
+                    break
+
+            if all_nvlink:
+                custom_print("All GPUs are fully connected via NVLink.")
+            else:
+                custom_print(
+                    "Warning: Not all GPUs are fully connected via NVLink. Some GPUs are connected via slower interfaces. "
+                    "It is recommended to switch to a different machine with faster GPU connections for optimal multi-GPU training performance."
+                )
+
+        except Exception as e:
+            custom_print(f"An error occurred: {e}")
+
+        except Exception as e:
+            custom_print(f"An error occurred: {e}")

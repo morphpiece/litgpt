@@ -1,16 +1,16 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
-from pathlib import Path
 import os
-from unittest import mock
-
-import pytest
-import requests
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
+from unittest import mock
 
+import pytest
+import requests
+from tests.conftest import RunIf
 
 REPO_ID = Path("EleutherAI/pythia-14m")
 CUSTOM_TEXTS_DIR = Path("custom_texts")
@@ -31,12 +31,6 @@ def run_command(command):
         raise RuntimeError(error_message) from None
 
 
-@pytest.mark.skipif(
-    sys.platform.startswith("win") or
-    sys.platform == "darwin" or
-    'AGENT_NAME' in os.environ,
-    reason="Does not run on Windows, macOS, or Azure Pipelines"
-)
 @pytest.mark.dependency()
 def test_download_model():
     repo_id = str(REPO_ID).replace("\\", "/")  # fix for Windows CI
@@ -46,6 +40,11 @@ def test_download_model():
     s = Path("checkpoints") / repo_id
     assert f"Saving converted checkpoint to {str(s)}" in output
     assert ("checkpoints" / REPO_ID).exists()
+
+    # Also test valid but unsupported repo IDs
+    command = ["litgpt", "download", "CohereForAI/aya-23-8B"]
+    output = run_command(command)
+    assert "Unsupported `repo_id`" in output
 
 
 @pytest.mark.dependency()
@@ -65,10 +64,19 @@ def test_download_books():
 @mock.patch.dict(os.environ, {"LT_ACCELERATOR": "cpu"})
 @pytest.mark.dependency(depends=["test_download_model"])
 def test_chat_with_model():
-    command = ["litgpt", "generate", f"checkpoints" / REPO_ID]
+    command = ["litgpt", "generate", "checkpoints" / REPO_ID]
     prompt = "What do Llamas eat?"
     result = subprocess.run(command, input=prompt, text=True, capture_output=True, check=True)
     assert "What food do llamas eat?" in result.stdout
+
+
+@RunIf(min_cuda_gpus=1)
+@pytest.mark.dependency(depends=["test_download_model"])
+def test_chat_with_quantized_model():
+    command = ["litgpt", "generate", "checkpoints" / REPO_ID, "--quantize", "bnb.nf4", "--precision", "bf16-true"]
+    prompt = "What do Llamas eat?"
+    result = subprocess.run(command, input=prompt, text=True, capture_output=True, check=True)
+    assert "What food do llamas eat?" in result.stdout, result.stdout
 
 
 @mock.patch.dict(os.environ, {"LT_ACCELERATOR": "cpu"})
@@ -101,6 +109,11 @@ def test_finetune_model():
     assert (OUT_DIR/"final"/"lit_model.pth").exists(), "Model file was not created"
 
 
+@pytest.mark.skipif(
+    sys.platform.startswith("win") or
+    sys.platform == "darwin",
+    reason="`torch.compile` is not supported on this OS."
+)
 @mock.patch.dict(os.environ, {"LT_ACCELERATOR": "cpu"})
 @pytest.mark.dependency(depends=["test_download_model", "test_download_books"])
 def test_pretrain_model():
@@ -115,12 +128,22 @@ def test_pretrain_model():
         "--eval.max_iters", "1",         # to accelerate things for CI
         "--out_dir", str(OUT_DIR)
     ]
-    run_command(pretrain_command)
+    output = run_command(pretrain_command)
 
+    assert "Warning: Preprocessed training data found" not in output
     assert (OUT_DIR / "final").exists(), "Pretraining output directory was not created"
     assert (OUT_DIR / "final" / "lit_model.pth").exists(), "Model file was not created"
 
+    # Test that warning is displayed when running it a second time
+    output = run_command(pretrain_command)
+    assert "Warning: Preprocessed training data found" in output
 
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win") or
+    sys.platform == "darwin",
+    reason="`torch.compile` is not supported on this OS."
+)
 @mock.patch.dict(os.environ, {"LT_ACCELERATOR": "cpu"})
 @pytest.mark.dependency(depends=["test_download_model", "test_download_books"])
 def test_continue_pretrain_model():

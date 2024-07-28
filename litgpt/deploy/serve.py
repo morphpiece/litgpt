@@ -9,14 +9,14 @@ from lightning_utilities.core.imports import RequirementCache
 import torch
 
 
-from litgpt.model import GPT
+from litgpt.model import GPT  # needs to be imported before config
 from litgpt.config import Config
 from litgpt.tokenizer import Tokenizer
 from litgpt.generate.base import generate as plain_generate
 from litgpt.chat.base import generate as stream_generate
 from litgpt.prompts import load_prompt_style, has_prompt_style, PromptStyle
 from litgpt.utils import (
-    extend_checkpoint_dir,
+    auto_download_checkpoint,
     get_default_supported_precision,
     load_checkpoint
 )
@@ -71,9 +71,11 @@ class BaseLitAPI(LitAPI):
         )
         with fabric.init_module(empty_init=True):
             model = GPT(config)
-        with fabric.init_tensor():
-            # enable the kv cache
-            model.set_kv_cache(batch_size=1)
+
+        # This should be set if we add a compile feature later
+        # with fabric.init_tensor():
+        #     model.set_kv_cache(batch_size=1)
+
         model.eval()
 
         self.model = fabric.setup_module(model)
@@ -106,6 +108,11 @@ class SimpleLitAPI(BaseLitAPI):
         prompt_length = inputs.size(0)
         max_returned_tokens = prompt_length + self.max_new_tokens
 
+        first_turn = self.model.mask_cache is None
+        if first_turn or max_returned_tokens > self.model.max_seq_length:
+            self.model.max_seq_length = max_returned_tokens
+            self.model.set_kv_cache(batch_size=1, device=self.device)
+
         y = plain_generate(
             self.model,
             inputs,
@@ -117,8 +124,7 @@ class SimpleLitAPI(BaseLitAPI):
             include_prompt=False
         )
 
-        for block in self.model.transformer.h:
-            block.attn.kv_cache.reset_parameters()
+        self.model.clear_kv_cache()
         return y
 
     def encode_response(self, output: torch.Tensor) -> Dict[str, Any]:
@@ -145,18 +151,23 @@ class StreamLitAPI(BaseLitAPI):
         prompt_length = inputs.size(0)
         max_returned_tokens = prompt_length + self.max_new_tokens
 
-        for block in self.model.transformer.h:
-            block.attn.kv_cache.reset_parameters()
+        first_turn = self.model.mask_cache is None
+        if first_turn or max_returned_tokens > self.model.max_seq_length:
+            self.model.max_seq_length = max_returned_tokens
+            self.model.set_kv_cache(batch_size=1, device=self.device)
 
-        yield from stream_generate(
-            self.model,
-            inputs,
-            max_returned_tokens,
-            temperature=self.temperature,
-            top_k=self.top_k,
-            top_p=self.top_p,
-            stop_tokens=([self.tokenizer.eos_id],)
-        )
+        try:
+            yield from stream_generate(
+                self.model,
+                inputs,
+                max_returned_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                stop_tokens=([self.tokenizer.eos_id],)
+            )
+        finally:
+            self.model.clear_kv_cache()
 
     def encode_response(self, output):
         for out in output:
@@ -167,13 +178,14 @@ def run_server(
     checkpoint_dir: Path,
     precision: Optional[str] = None,
     temperature: float = 0.8,
-    top_k: int = 200,
+    top_k: int = 50,
     top_p: float = 1.0,
     max_new_tokens: int = 50,
     devices: int = 1,
     accelerator: str = "auto",
     port: int = 8000,
-    stream: bool = False
+    stream: bool = False,
+    access_token: Optional[str] = None,
 ) -> None:
     """Serve a LitGPT model using LitServe.
 
@@ -207,11 +219,10 @@ def run_server(
             The "auto" setting (default) chooses a GPU if available, and otherwise uses a CPU.
         port: The network port number on which the model is configured to be served.
         stream: Whether to stream the responses.
+        access_token: Optional API token to access models with restrictions.
     """
-    checkpoint_dir = extend_checkpoint_dir(checkpoint_dir)
+    checkpoint_dir = auto_download_checkpoint(model_name=checkpoint_dir, access_token=access_token)
     pprint(locals())
-
-    check_valid_checkpoint_dir(checkpoint_dir, model_filename="lit_model.pth")
 
     if not stream:
         server = LitServer(
